@@ -1,0 +1,539 @@
+---
+title: "PetFinder"
+author: "Bruce Wayne"
+date: "Jan 09, 2019"
+output:
+  html_document:
+    fig_height: 4
+    fig_width: 8
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+    fig_caption: true
+    toc: true
+---
+
+#Choose working Directory (Home vs Work)
+
+```{r}
+#home
+setwd("/Users/andrewcohen/Desktop/all")
+#work
+#setwd("/Users/andrewcohen/Desktop/all")
+```
+
+#Purpose
+
+The purpose of this kernel is to help the fluffy animals in need. I just love cats and dogs and own a cat myself so I was destined to join this competition. Hope you find this kernel helpful. If not then please enjoy this cute kitty below  
+
+<center><img src="https://i.pinimg.com/originals/1d/f7/06/1df706ae30095ad907b9046cdaae2db6.jpg" style="length: 100px, width:600px;"/></center>  
+
+#Introduction
+
+Loading the Libararies
+```{r loadlib, message=FALSE, warning=FALSE, results='hide'}
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(caret)
+library(plyr)
+library(ggplot2)
+library(tibble)
+library(gridExtra)
+library(sentimentr)
+library(tm)
+library(h2o)
+library(corrplot)
+library(quanteda)
+library(Metrics)
+library(stringr)
+library(forcats)
+```
+
+Loading the functions
+```{r functions, message=FALSE, warning=FALSE,}
+#Function to change index to column
+index_to_col <- function(data, Column_Name){
+          data <- cbind(newColName = rownames(data), data)
+          rownames(data) <- 1:nrow(data)
+          colnames(data)[1] <- Column_Name
+          return (data)
+}
+
+#Missing Values Functions
+missing_values <- function(data){
+  mv <- as.data.frame(apply(data, 2, function(col)sum(is.na(col))/length(col)))
+  colnames(mv)[1] <- "missing_values"
+  mv <- index_to_col(mv,'Column')
+  mv <- setDT(mv)[order (missing_values, decreasing = TRUE)]
+}
+
+#Loading all the plotting functions
+plotHist <- function(data_in, i) {
+  data <- data.frame(x=data_in[[i]])
+  p <- ggplot(data=data, aes(x=x)) + geom_histogram(bins=100, fill="#0072B2", alpha = .9) + xlab(colnames(data_in)[i]) + theme_light() + 
+    theme(axis.text.x = element_text(angle = 90, hjust =1))
+  return (p)
+}
+
+plotBar <- function(data_in, i) {
+  data <- data.frame(x=data_in[[i]])
+  p <- ggplot(data=data, aes(x=x)) + geom_bar(fill="steelblue",color = 'black') + xlab(colnames(data_in)[i]) + theme_light() + theme(axis.text.x = element_text(angle = 90, hjust =1))
+  return (p)
+}
+
+plotCorr <- function(data_in, list1,list2,i){
+  data <- data.frame(x = data_in[[list1[i]]], y = data_in[[list2[i]]])
+  p <- ggplot(data, aes(x = x, y = y)) + geom_smooth(method = lm ) + geom_point(aes(x = x, y = y)) +
+  geom_jitter(width = 0.1, height = 0.1)  + xlab(paste0(list1[i], '\n', 'R-Squared: ', round(cor(data_in[[list1[i]]], data_in[[list2[i]]], use = 'pairwise.complete.obs'), 3))) + theme_light() + ylab(paste0(list2[i]))
+  return(suppressWarnings(p))
+}
+
+doPlotsCorr <- function(data_in, fun, list1,list2,ii, ncol=3) {
+  pp <- list()
+  for (i in ii) {
+    p <- fun(data_in=data_in, list1,list2,i=i)
+    pp <- c(pp, list(p))
+  }
+  do.call("grid.arrange", c(pp, ncol=ncol))
+}
+
+plotDen <- function(data_in, i) {
+  data <- data.frame(x=data_in[[i]])
+  p <- ggplot(data=data, aes(x=x)) + geom_density(aes(group=as.factor(dt1_tran$TARGET),color=as.factor(dt1_tran$TARGET),fill=as.factor(dt1_tran$TARGET), alpha=0.2)) + xlab(colnames(data_in)[i]) + theme_light() + 
+    theme(axis.text.x = element_text(angle = 90, hjust =1)) + theme(legend.position='none')
+  return (p)
+}
+
+doPlots <- function(data_in, fun, ii, ncol=3) {
+  pp <- list()
+  for (i in ii) {
+    p <- fun(data_in=data_in, i=i)
+    pp <- c(pp, list(p))
+  }
+  do.call("grid.arrange", c(pp, ncol=ncol))
+}
+
+```
+
+Loading the data
+```{r loaddata, message=FALSE, warning=FALSE,}
+ tr <- fread("train.csv")
+ te <- fread("test/test.csv")
+ sub <- fread('test/sample_submission.csv')
+ breed_lab <- fread('breed_labels.csv')
+ color_lab <- fread('color_labels.csv')
+```
+
+#Preview of the data
+
+Looking at the variables and dimensions in each of the tables
+
+```{r glimpse}
+glimpse(tr)
+glimpse(te)
+```
+
+#Target Variable
+
+Lets first look at the distribution of the target variable. Seems like there is an outlier. We will look into it more going forward
+
+```{r, message=FALSE, warning=FALSE,}
+colnames(tr)[24] <- 'target'
+ggplot(data=tr, aes(x=target)) + geom_bar(color = 'black', fill = 'steelblue') + theme_bw()
+```
+
+Extracting the data for Sentiment analysis
+
+```{r sentiment}
+######################################################################################################################
+# The below function to read in the sentiment files comes from
+# Jason's kernel: https://www.kaggle.com/jaseziv83/eda-for-all-and-preprocessed-vars-except-images and originally from
+# Greg Murray's kernel: https://www.kaggle.com/gregmurray30/ordinal-logit/code
+######################################################################################################################
+
+library(jsonlite)
+filenames_train <- list.files("/Users/andrewcohen/Desktop/all/train_sentiment", full.names=TRUE)
+filenames_test <- list.files("/Users/andrewcohen/Desktop/all/test_sentiment", full.names=TRUE)
+
+get_scores <- function(fnames, n_char) {
+  sent_json <- list(length(fnames))
+  for( i in (1:length(fnames))){
+    temp_json <- fromJSON(fnames[i])
+    petid <- unlist(word(str_extract(fnames[i], '\\b[^/]+$'),sep = "\\."))
+    temp_pair <- list(petid, temp_json[4][[1]][[1]], temp_json[4][[1]][[2]])
+    sent_json[[i]] <- temp_pair
+  }
+  sent_df <- data.frame(matrix(unlist(sent_json), nrow=length(sent_json), byrow=T))
+  return(sent_df)
+}
+
+train_sent_df <- get_scores(filenames_train, 26)
+test_sent_df <- get_scores(filenames_test, 25)
+
+colnames(train_sent_df) <- c("PetID", "score", "magnitude")
+colnames(test_sent_df) <- c("PetID", "score", "magnitude")
+
+tr_te_sent <- rbind(train_sent_df, test_sent_df)
+
+tr_te_sent$PetID <- as.character(tr_te_sent$PetID)
+```
+
+Combining Training and testing datasets
+
+```{r}
+tr_rows <- nrow(tr)
+Target <- tr$target
+tr <- rbind(tr[,-c('target')],te)
+
+tr_test <- tr %>%
+  left_join(tr_te_sent, by = "PetID") %>%
+  mutate(score = as.numeric(score),
+         magnitude = as.numeric(magnitude),
+         score = ifelse(is.na(score), 0, score),
+         magnitude = ifelse(is.na(magnitude), 0, magnitude))
+
+#Adding variable names
+tr <- mutate(tr, nColors = ifelse(Color2 == 0, 1, 
+                ifelse(Color3 == 0, 2, 3)))
+
+tr <- mutate(tr, Name = ifelse(Name == '','Empty',Name))
+tr <- mutate(tr, Gender = ifelse(Gender == 1,'Male',
+                                 ifelse(Gender == 2,'Female',
+                                      ifelse(Gender == 3,'Mixed',NA))))
+
+tr <- mutate(tr, PureBreed = ifelse(Breed1 == 0 | Breed2 == 0, "Pure Breed", "Not Pure"),
+         HasName = ifelse(Name != 'Empty', "Yes", "No"),
+         QuantityGroup = fct_lump(factor(Quantity), n = 7))
+
+colnames(breed_lab)[1] <- 'Breed1'
+tr <- left_join(tr,breed_lab, by = c('Type','Breed1'))
+tr <- setDT(tr)[,-c('Breed1')]
+colnames(tr)[ncol(tr)] <- 'BreedName1'
+tr$BreedName1[is.na(tr$BreedName1)] <- 'None'
+
+
+colnames(breed_lab)[1] <- 'Breed2'
+tr <- left_join(tr,breed_lab, by = c('Type','Breed2'))
+tr <- setDT(tr)[,-c('Breed2')]
+colnames(tr)[ncol(tr)] <- 'BreedName2'
+tr$BreedName2[is.na(tr$BreedName2)] <- 'None'
+
+tr <- mutate(tr, Type = ifelse(Type == 1,'Dog','Cat'))
+
+colnames(color_lab)[1] <- 'Color1'
+tr <- left_join(tr,color_lab, by = c('Color1'))
+tr <- setDT(tr)[,-c('Color1')]
+colnames(tr)[ncol(tr)] <- 'ColorType1'
+tr$ColorType1[is.na(tr$ColorType1)] <- 'None'
+
+colnames(color_lab)[1] <- 'Color2'
+tr <- left_join(tr,color_lab, by = c('Color2'))
+tr <- setDT(tr)[,-c('Color2')]
+colnames(tr)[ncol(tr)] <- 'ColorType2'
+tr$ColorType2[is.na(tr$ColorType2)] <- 'None'
+
+colnames(color_lab)[1] <- 'Color3'
+tr <- left_join(tr,color_lab, by = c('Color3'))
+tr <- setDT(tr)[,-c('Color3')]
+colnames(tr)[ncol(tr)] <- 'ColorType3'
+tr$ColorType3[is.na(tr$ColorType3)] <- 'None'
+```
+
+#Dataset Exploration
+
+Lets look at all the numeric variables in the train dataset
+
+```{r, message=FALSE, warning=FALSE,}
+samplesize <- 1
+mv <- missing_values(setDT(tr)[sample(nrow(tr), round(nrow(tr)*samplesize,0)),])
+
+ggplot (mv[1:10,], aes (reorder(Column, missing_values), missing_values)) + geom_bar (position = position_dodge(), stat = "identity", color = 'black', fill = 'steelblue') + coord_flip () + xlab('Columns') + ylab('Missing Value %') + theme_classic()
+
+sum(mv$missing_values)
+tr[is.na(tr)] <- 0
+```
+
+**Findings:**There are 2 variables with missing values
+
+There are categories in the dataset that are not supposed to be ordinal. I would change them to categorical features
+
+```{r}
+cols_to_change <- c('Vaccinated','Dewormed','Sterilized','State')
+tr[, (cols_to_change) := lapply(.SD, as.character), .SDcols = cols_to_change]
+```
+
+```{r, message=FALSE, warning=FALSE,}
+numeric_list <- unlist(lapply(tr, is.numeric))
+tr_num <- setDT(tr)[sample(nrow(tr), round(nrow(tr)*samplesize,0)),][,..numeric_list]
+
+doPlots(tr_num, plotHist, 1:ncol(tr_num))
+```
+
+**Findings:** Seems like there are a bunch of animals with really high age and fee. 
+
+```{r, message=FALSE, warning=FALSE,}
+non_numeric_list <- unlist(lapply(tr, is.character))
+tr_non_num <- setDT(tr)[sample(nrow(tr_num), round(nrow(tr_num)*samplesize,0)),][,..non_numeric_list]
+
+sapply(tr_non_num, uniqueN)
+unique_var <- as.data.frame(sapply(tr_non_num, uniqueN))
+colnames(unique_var)[1] <- "Counts"
+unique_var <- index_to_col(unique_var,'Variable')
+unique_col <- setDT(unique_var)[Counts <=10]$Variable
+
+tr_non_num_sub <- tr_non_num[,..unique_col]
+
+doPlots(tr_non_num_sub, plotBar, 1:ncol(tr_non_num_sub))
+```
+
+#Text Analysis
+
+```{r}
+tr[Description == 'No description yet', Description := NA]
+dcorpus <- corpus(tr$Description)
+dfm1 <- dfm(
+    dcorpus, 
+    ngrams = 1, 
+    remove = c("rm", stopwords("english")),
+    remove_punct = TRUE,
+    remove_numbers = TRUE,
+    stem = TRUE)
+
+# get 25 most common words
+tf <- topfeatures(dfm1, n = 25)
+
+# convert to df and plot
+data.frame(term = names(tf), freq = unname(tf)) %>%
+    ggplot(aes(x = reorder(term, freq), y = freq/1000)) + 
+    geom_bar(stat = 'identity', fill = 'steelblue', color = 'black') + 
+    labs(x = '', y = 'Frequency (000s)', title = '25 most common description words') + 
+    coord_flip() 
+```
+
+
+```{r bigrams}
+dfm2 <- dcorpus %>%
+    corpus_sample(size = floor(ndoc(dcorpus))) %>%
+    dfm(
+        ngrams = 2,
+        ignoredFeatures = c("rm", stopwords("english")),
+        remove_punct = TRUE,
+        remove_numbers = TRUE,
+        concatenator = " "
+    )
+# get 25 most common bigrams
+tf <- topfeatures(dfm2, n = 25)
+
+# convert to df and plot
+data.frame(term = names(tf), freq = unname(tf)) %>%
+    ggplot(aes(x = reorder(term, freq), y = freq/1000)) + 
+    geom_bar(stat = 'identity', fill = 'steelblue', color = 'black') + 
+    labs(x = '', y = 'Frequency (000s)', title = '25 most common description words with 2-grams') + 
+    coord_flip() 
+```
+
+```{r trigrams}
+dfm3 <- dcorpus %>%
+    corpus_sample(size = floor(ndoc(dcorpus))) %>%
+    dfm(
+        ngrams = 3,
+        ignoredFeatures = c("rm", stopwords("english")),
+        remove_punct = TRUE,
+        remove_numbers = TRUE,
+        concatenator = " "
+    )
+# get 25 most common bigrams
+tf <- topfeatures(dfm3, n = 25)
+
+# convert to df and plot
+data.frame(term = names(tf), freq = unname(tf)) %>%
+    ggplot(aes(x = reorder(term, freq), y = freq/1000)) + 
+    geom_bar(stat = 'identity', fill = 'steelblue', color = 'black') + 
+    labs(x = '', y = 'Frequency (000s)', title = '25 most common description words with 3-grams') + 
+    coord_flip() 
+```
+
+#Feature Engineering
+
+```{r}
+str_eval=function(x) {return(eval(parse(text=x)))}
+
+cat_cols <- c('Type','BreedName1','BreedName2','Gender','ColorType1','ColorType2','ColorType3','Vaccinated','Dewormed','Sterilized')
+
+#Length of Desc
+tr_non_num$len_desc <- nchar(tr_non_num$Description) 
+tr_non_num$n_words_desc <- sapply(strsplit(tr_non_num$Description, " "), length) 
+
+tr_non_num <- as.data.frame(tr_non_num)
+
+# for (i in (1:length(cat_cols))){
+#   for (j in (i:length(cat_cols))){
+#     if (i != j){
+#       col_name <- paste(colnames(tr_non_num[,cat_cols])[i],"_",colnames(tr_non_num[,cat_cols])[j],sep="")
+#       assign(col_name,
+#              paste(tr_non_num[,cat_cols[i]],'_',tr_non_num[,cat_cols[j]],sep=""))
+#       tr_non_num <- cbind(tr_non_num, str_eval(col_name))
+#       colnames(tr_non_num)[ncol(tr_non_num)] <- paste(col_name)
+#       rm(col_name)
+#     }
+#   }
+# }
+
+  
+```
+
+#Correlation and One Hot encoding
+
+```{r}
+#variance and high correlation
+tr_num <- tr_num[,-c('target')]
+
+nzv <- nearZeroVar(tr_num,saveMetrics= TRUE)
+nzv_tb <- setDT(nzv)[zeroVar ==TRUE]
+nzv_tb
+```
+
+Correlation Matrix
+
+```{r}
+correlations <- cor(na.omit(tr_num))
+corrplot(correlations, method="square")
+
+df_corr = cor(tr_num, use = "pairwise.complete.obs")
+hc = findCorrelation(df_corr, cutoff=0.80)
+hc = sort(hc)
+tr_num2 = as.data.frame(tr_num)[,-c(hc)]
+
+#Highly correlated vairables table format
+df_corr2 <- df_corr %>%
+  as.data.frame() %>%
+  mutate(var1 = rownames(.)) %>%
+  gather(var2, value, -var1) %>%
+  arrange(desc(value)) %>%
+  group_by(value)
+
+corr_tb <- setDT(df_corr2)[abs(value) > 0.8 & var1 != var2]
+corr_tb <- corr_tb[!duplicated(corr_tb$value),]
+corr_tb
+```
+
+**Findings**: There are no highly correlation variables
+
+One hot encoding: Changing the features to factors
+
+```{r}
+#One hot encoding of char cols (create as factors)
+col_rm <- c('Description','PetID','Name')
+tr_non_num <- as.data.frame(tr_non_num)[, !(colnames(tr_non_num) %in% col_rm)]
+tr_non_num <- as.data.frame(unclass(tr_non_num))
+
+#Combining numeric and char for modelling
+df_final <- setDT(cbind(tr_num,tr_non_num))
+
+factor_columns <- c("Type", "Gender", "ColorType1", "ColorType2", "ColorType3", "MaturitySize", "FurLength", "Vaccinated", "Dewormed", "State", "Sterilized", "Health")
+character_columns <- c("RescuerID")
+numeric_columns <- c("Age", "BreedName1", "Quantity","Fee", "VideoAmt", "PhotoAmt","len_desc",'n_words_desc')
+
+df_final <- df_final %>% mutate_at(factor_columns, funs(as.factor(.)))
+df_final <- df_final %>% mutate_at(character_columns, funs(as.character(.)))
+df_final <- df_final %>% mutate_at(numeric_columns, funs(as.numeric(.)))
+
+df_pre_model <- setDT(cbind(df_final[1:tr_rows,],Target = as.factor(Target)))
+
+colnames(df_pre_model)
+nrow(df_pre_model)
+```
+
+#Preliminary Model
+
+```{r rf, message=FALSE, warning=FALSE,}
+h2o.init(nthreads = -1)
+df_model.hex <- as.h2o(df_pre_model)
+split_h2o <- h2o.splitFrame(df_model.hex, c(0.6, 0.2), seed = 1234)
+train <- h2o.assign(split_h2o[[1]],'train.hex')
+valid <- h2o.assign(split_h2o[[2]],'valid.hex')
+test <- h2o.assign(split_h2o[[3]],'test.hex')
+
+rforest.model <- h2o.randomForest(y=ncol(df_pre_model), x=1:(ncol(df_pre_model)-1), 
+                                  training_frame = train, 
+                                  validation_frame = valid,
+                                 ntrees = 100,
+                                  seed = 1122)
+
+h2o.varimp_plot(rforest.model, num_of_features = 15)
+h2o.performance(rforest.model, test)
+```
+
+```{r}
+ScoreQuadraticWeightedKappa <- function (rater.a , rater.b, 
+                                        min.rating,
+                                        max.rating) {
+
+    if (missing(min.rating)) {
+        min.rating <- min(min(rater.a),min(rater.b))
+    }
+    if (missing(max.rating)) {
+        max.rating <- max(max(rater.a),max(rater.b))
+    }
+    
+    rater.a <- factor(rater.a, levels<-min.rating:max.rating)
+    rater.b <- factor(rater.b, levels<-min.rating:max.rating)
+
+    #pairwise frequencies
+    confusion.mat <- table(data.frame(rater.a, rater.b))
+    confusion.mat <- confusion.mat / sum(confusion.mat)
+    
+    #get expected pairwise frequencies under independence
+    histogram.a <- table(rater.a) / length(table(rater.a))
+    histogram.b <- table(rater.b) / length(table(rater.b))
+    expected.mat <- histogram.a %*% t(histogram.b)
+    expected.mat <- expected.mat / sum(expected.mat)
+
+    #get weights
+    labels <- as.numeric( as.vector (names(table(rater.a))))
+    weights <- outer(labels, labels, FUN <- function(x,y) (x-y)^2 )
+
+    #calculate kappa
+    kappa <- 1 - sum(weights*confusion.mat)/sum(weights*expected.mat)
+    kappa
+}
+
+
+```
+
+Trying out AutoML in H2O
+
+```{r h2o model, message=FALSE, warning=FALSE}
+ # automl_h2o_models <- h2o.automl(
+ #     x = 1:(ncol(df_pre_model)-1), 
+ #     y = ncol(df_pre_model),
+ #     training_frame    = train,
+ #     leaderboard_frame = valid,
+ #     max_models=35,
+ #     nfolds = 3
+ #     )
+ # automl_leader <- automl_h2o_models@leader
+ # automl_leader 
+ # 
+ # h2o.varimp_plot(automl_leader, num_of_features = 15)
+ # h2o.performance(automl_leader,test)
+```
+
+Predicting
+
+```{r warning=FALSE}
+df_pre_model_te <- cbind(df_final[(tr_rows+1):nrow(tr),])
+nrow(df_pre_model_te)
+df_pre_model_te <- as.h2o(df_pre_model_te)
+predict.model <- as.data.frame(h2o.predict(rforest.model,df_pre_model_te))
+```
+
+Output file
+
+```{r}
+te_result <- cbind(te[,c('PetID')],AdoptionSpeed = predict.model[,1])
+sub_final <- inner_join(sub[,c('PetID')],te_result, by = c('PetID'))
+write.csv(sub_final, file = "submission.csv", row.names = FALSE)
+```
