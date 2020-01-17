@@ -1,0 +1,149 @@
+---
+title: "Predicting Air BnB Prices"
+author: "Andrew Cohen"
+date: "1/10/2020"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r readin and eda, include=TRUE}
+library(readr)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(xgboost)
+library(dummies)
+library(rsample)
+
+df_listings <- read_csv("/Users/cohean/Desktop/DataSciChallenge/listings.csv", 
+                        col_types = cols(host_id = col_character(), 
+                                         id = col_character()))
+# EDA
+# library(rpivotTable)
+# rpivotTable(df_listings)
+
+summary(df_listings)
+
+# remove nuisance columns
+# additional analysis thoughts, potentially can include the "name" column using nlp techniques
+df_listings <- subset(df_listings, select = -c(id, name, host_id, host_name, neighbourhood))
+
+# check categorical for errors vars before encoding 
+df_listings %>% count(neighbourhood_group, sort = TRUE)
+df_listings %>% count(room_type, sort = TRUE)
+#df_listings %>% count(neighbourhood, sort = TRUE)
+
+
+# lapply(df_listings,class)
+hist(df_listings$price, breaks = 500, main = "Price")
+# boxplot(df_listings$price)
+
+#remove outliers
+df_model <- df_listings[df_listings$price<3500,]
+# remove zeros
+df_model <- df_model[df_model$price != 0,]
+hist(df_model$price, breaks = 250, main = "Price")
+
+# boxplot room type
+ggplot(df_model, aes(x=room_type, y=price, fill=room_type)) + 
+  geom_boxplot() + 
+  coord_cartesian(ylim = c(0, 500)) #zoom into center of data
+
+# boxplot boro
+ggplot(df_model, aes(x=neighbourhood_group, y=price, fill=neighbourhood_group)) + 
+  geom_boxplot() + 
+  coord_cartesian(ylim = c(0, 500)) #zoom into center of data
+
+# grouped boxplot
+ggplot(df_listings, aes(x=neighbourhood_group, y=price, fill=room_type)) + 
+  geom_boxplot() + 
+  coord_cartesian(ylim = c(0, 500)) #zoom into center of data
+
+numericV <- which(sapply(df_model, is.numeric)) 
+cor(df_model$price,df_model[,numericV])
+#not much correlation among numeric vars
+
+```
+
+```{r models, include=TRUE}
+# impute mean for missing to keep from loosing data
+df_imp <- transform(df_model, 
+                    reviews_per_month = ifelse(is.na(reviews_per_month), 
+                                               mean(reviews_per_month, na.rm=TRUE), reviews_per_month))
+
+# split data for models
+df_split <- initial_split(df_imp, prop = .7)
+df_train <- training(df_split)
+df_test  <- testing(df_split)
+
+# one-hot
+df_dummy_train <- dummy.data.frame(df_train, names = c("neighbourhood_group","room_type") , sep = ".")
+df_dummy_test <- dummy.data.frame(df_test, names = c("neighbourhood_group","room_type") , sep = ".")
+
+# seperate X and Y matrices
+df_train_x <- subset(df_dummy_train, select = -c(price))
+df_train_y <- subset(df_dummy_train, select = c(price))
+df_test_x <- subset(df_dummy_test, select = -c(price))
+df_test_y <- subset(df_dummy_test, select = c(price))
+
+# using xgboost is one of the best places to start for a predictive model because it usually fits very well without much tuning.
+xgb.train <- xgb.DMatrix(data = as.matrix(df_train_x), label=as.matrix(df_train_y))
+xgb.test <- xgb.DMatrix(data = as.matrix(df_test_x), label=as.matrix(df_test_y))
+
+# parameters based on some light tuning using regression performance metrics like rmse
+params <- list(
+  booster = "dart",
+  #objective = "reg:gamma",
+  max.depth = 5,
+  eta = 0.007,
+  #subsample = 0.60,
+  eval_metric = "rmse"
+  # ,eval_metric = "mae"
+  )
+
+xgb.fit<-xgb.train(
+        data = xgb.train,
+        params = params,
+        nrounds = 300, # cut off based on rmse
+        #watchlist = list(test=xgb.test,train=xgb.train),
+        #verbose = 1
+        )
+
+# performance
+xgb.fit
+
+# feature importance
+xgb.importance(colnames(xgb.train), model = xgb.fit)
+
+# pred price distrubution comparison
+xgb.pred <- predict(xgb.fit,xgb.test,reshape=T)
+hist(xgb.pred, breaks = 100,main = "XGB Pred Price",xlim = c(-20 , +500))
+hist(df_test_y$price, breaks = 1000,main = "Price",xlim = c(-20 , +500))
+
+# generalized linear model
+df_train$logprice <- log(df_train$price)
+df_test$logprice <- log(df_test$price)
+
+glm_m <- glm(logprice ~ ., data = subset(df_train, select = -c(price)))
+summary(glm_m)
+
+hist(predict(glm_m,df_test), breaks = 100,main = "Predicted Log Price")
+hist(df_test$logprice, breaks = 100, main = "Log Price")
+
+# both models are pretty good starts
+# xgboost seems better based on the distribution of the residuals 
+# similar feature importance
+
+```
